@@ -18,6 +18,7 @@ from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 from torchvision.models import ResNet18_Weights, ResNet34_Weights, EfficientNet_B7_Weights
 from tqdm import tqdm
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Set random seed for reproducibility
 torch.manual_seed(42)
@@ -74,10 +75,10 @@ def augment_dataset(dataset, num_augmentations=5):
             angle = random.randint(-25, 25)
             aug_img = transforms.functional.rotate(aug_img, angle)
 
-            # Random affine
+            #Random affine
             aug_img = transforms.RandomAffine(degrees=0, translate=(0.05, 0.05))(aug_img)
 
-            # Gaussian blur
+            #Gaussian blur
             if random.random() > 0.7:
                 aug_img = transforms.GaussianBlur(kernel_size=3)(aug_img)
 
@@ -91,10 +92,10 @@ def augment_dataset(dataset, num_augmentations=5):
             #     aug_img = lam * img + (1 - lam) * img2
             #     label = lam * label + (1 - lam) * label2
 
-            # Add Gaussian noise
-            noise = torch.randn_like(aug_img) * 0.05
-            aug_img = aug_img + noise
-            aug_img = torch.clamp(aug_img, 0.0, 1.0)
+            # # Add Gaussian noise
+            # noise = torch.randn_like(aug_img) * 0.05
+            # aug_img = aug_img + noise
+            # aug_img = torch.clamp(aug_img, 0.0, 1.0)
 
             augmented_images.append(aug_img)
             augmented_labels.append(label)
@@ -105,7 +106,7 @@ def augment_dataset(dataset, num_augmentations=5):
 ####################################### MODEL DEFINITION #######################################
 
 # Train and evaluate model
-def train_resnet_model(train_loader, test_loader, num_classes, num_epochs=20, lr=1e-3, device=None):
+def train_resnet_model(train_loader, test_loader, num_classes, num_epochs=40, lr=1e-3, device=None):
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
@@ -118,10 +119,18 @@ def train_resnet_model(train_loader, test_loader, num_classes, num_epochs=20, lr
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    # criterion = nn.BCEWithLogitsLoss()  # For multi-label classification
+
+    
+    # optimizer = optim.Adam(model.parameters(), lr=lr)
+    # optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
+    # optimizer = optim.Adadelta(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = optim.Adagrad(model.parameters(), lr=lr, weight_decay=1e-4)
 
     # Use CosineAnnealingLR for learning rate scheduling
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    # patience=3 means "wait 3 epochs without improvement"
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
 
     for epoch in range(num_epochs):
         model.train()
@@ -144,7 +153,8 @@ def train_resnet_model(train_loader, test_loader, num_classes, num_epochs=20, lr
             correct += predicted.eq(labels).sum().item()
 
         # Update the learning rate
-        scheduler.step()
+        # scheduler.step()
+        
         train_acc = correct / total * 100
         print(f"Train Loss: {running_loss:.4f}, Accuracy: {train_acc:.2f}%, Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
 
@@ -166,6 +176,8 @@ def train_resnet_model(train_loader, test_loader, num_classes, num_epochs=20, lr
 
         test_acc = correct / total * 100
         print(f"Test Accuracy: {test_acc:.2f}%\n")
+
+        scheduler.step(test_acc)
 
     return model, all_preds, all_labels
 
