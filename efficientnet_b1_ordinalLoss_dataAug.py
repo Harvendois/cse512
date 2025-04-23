@@ -11,7 +11,7 @@ import os
 import random
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
-from torchvision.models import EfficientNet_B3_Weights
+from torchvision.models import EfficientNet_B1_Weights
 from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -19,6 +19,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 torch.manual_seed(42)
 np.random.seed(42)
 random.seed(42)
+torch.backends.cudnn.benchmark = True
 
 # Ordinal-aware loss (distance-penalized Cross Entropy)
 class OrdinalLoss(nn.Module):
@@ -33,10 +34,14 @@ class OrdinalLoss(nn.Module):
         distance = torch.abs(pred_labels - targets).float()
         return (1 + distance) * base_loss
 
-# Preprocessing pipeline
+# Preprocessing and augmentation pipeline
 transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=1),
-    transforms.Resize((300, 300)),
+    transforms.Resize((240, 240)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(degrees=25),
+    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.5),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.5], std=[0.5]),
     transforms.Lambda(lambda x: x.repeat(3, 1, 1))
@@ -45,13 +50,13 @@ transform = transforms.Compose([
 def load_dataset(root_dir, batch_size=32):
     train_dataset = datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=transform)
     test_dataset = datasets.ImageFolder(os.path.join(root_dir, 'test'), transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     return train_loader, test_loader, train_dataset.classes
 
 def train_model(train_loader, test_loader, num_classes, num_epochs=40, lr=1e-3):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = models.efficientnet_b3(weights=EfficientNet_B3_Weights.DEFAULT)
+    model = models.efficientnet_b1(weights=EfficientNet_B1_Weights.DEFAULT)
     model.classifier[1] = nn.Sequential(
         nn.Dropout(p=0.4),
         nn.Linear(model.classifier[1].in_features, num_classes)
@@ -120,3 +125,4 @@ root_dir = 'D:\\jungha\\2025 Spring\\MEC510\\term project\\Processed_Data\\manma
 train_loader, test_loader, class_names = load_dataset(root_dir)
 model, y_pred, y_true = train_model(train_loader, test_loader, num_classes=len(class_names))
 show_confusion(y_true, y_pred, class_names)
+
