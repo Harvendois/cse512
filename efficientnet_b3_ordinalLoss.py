@@ -79,7 +79,7 @@ class AugmentedDataset(Dataset):
     def __getitem__(self, idx):
         return self.images[idx], torch.tensor(self.labels[idx], dtype=torch.long)
 
-def augment_dataset(dataset, num_augmentations=3):
+def augment_dataset(dataset, num_augmentations):
     augmented_images = []
     augmented_labels = []
     raw_transform = dataset.transform
@@ -100,7 +100,7 @@ def load_dataset(root_dir, batch_size=32):
 
     train_dataset = TensorLabelWrapper(datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=base_transform))
 
-    augmented_images, augmented_labels = augment_dataset(raw_train, num_augmentations=5)
+    augmented_images, augmented_labels = augment_dataset(raw_train, num_augmentations=1)
     augmented_dataset = AugmentedDataset(augmented_images, augmented_labels)
 
     combined_dataset = ConcatDataset([train_dataset, augmented_dataset])
@@ -113,7 +113,7 @@ def load_dataset(root_dir, batch_size=32):
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     return train_loader, test_loader, raw_train.classes
 
-def train_model(train_loader, test_loader, num_classes, num_epochs=40, lr=1e-3):
+def train_model(train_loader, test_loader, num_classes, num_epochs=15, lr=1e-3):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = models.efficientnet_b3(weights=EfficientNet_B3_Weights.DEFAULT)
     model.classifier[1] = nn.Sequential(
@@ -123,7 +123,8 @@ def train_model(train_loader, test_loader, num_classes, num_epochs=40, lr=1e-3):
     model = model.to(device)
 
     criterion = OrdinalLoss(num_classes=num_classes)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    # optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adadelta(model.parameters(), lr=lr, rho=0.95, eps=1e-08, weight_decay=0.01)
     scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
 
     for epoch in range(num_epochs):
@@ -166,18 +167,10 @@ def train_model(train_loader, test_loader, num_classes, num_epochs=40, lr=1e-3):
     return model, all_preds, all_labels
 
 def show_confusion(y_true, y_pred, class_names):
-    numeric_labels = [int(name) for name in class_names]
-    sorted_indices = sorted(range(len(numeric_labels)), key=lambda i: numeric_labels[i])
-    sorted_class_names = [class_names[i] for i in sorted_indices]
-
-    label_map = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted_indices)}
-    remapped_y_true = [label_map[label] for label in y_true]
-    remapped_y_pred = [label_map[label] for label in y_pred]
-
-    cm = confusion_matrix(remapped_y_true, remapped_y_pred)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[str(name) for name in sorted(numeric_labels)])
+    cm = confusion_matrix(y_true, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
     disp.plot(xticks_rotation=45, cmap='Blues')
-    plt.title("Confusion Matrix (Sorted by Cycles)")
+    plt.title("Confusion Matrix")
     plt.tight_layout()
     plt.show()
 
