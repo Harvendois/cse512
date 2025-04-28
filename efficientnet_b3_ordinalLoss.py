@@ -5,7 +5,7 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, ConcatDataset
 import numpy as np
 import os
 import random
@@ -20,6 +20,9 @@ torch.manual_seed(42)
 np.random.seed(42)
 random.seed(42)
 
+def repeat_channels(x):
+    return x.repeat(3, 1, 1)
+
 # Ordinal-aware loss (distance-penalized Cross Entropy)
 class OrdinalLoss(nn.Module):
     def __init__(self, num_classes):
@@ -33,21 +36,82 @@ class OrdinalLoss(nn.Module):
         distance = torch.abs(pred_labels - targets).float()
         return (1 + distance) * base_loss
 
-# Preprocessing pipeline
-transform = transforms.Compose([
+# Preprocessing and augmentation pipeline
+base_transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=1),
     transforms.Resize((300, 300)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.5], std=[0.5]),
-    transforms.Lambda(lambda x: x.repeat(3, 1, 1))
+    transforms.Lambda(repeat_channels)
 ])
 
+aug_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),
+    transforms.Resize((300, 300)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(degrees=25),
+    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.5),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5]),
+    transforms.Lambda(repeat_channels)
+])
+
+class TensorLabelWrapper(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        image, label = self.dataset[idx]
+        return image, torch.tensor(label, dtype=torch.long)
+
+class AugmentedDataset(Dataset):
+    def __init__(self, images, labels):
+        self.images = images
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        return self.images[idx], torch.tensor(self.labels[idx], dtype=torch.long)
+
+def augment_dataset(dataset, num_augmentations=3):
+    augmented_images = []
+    augmented_labels = []
+    raw_transform = dataset.transform
+    dataset.transform = None
+
+    for img, label in dataset:
+        for _ in range(num_augmentations):
+            aug_img = aug_transform(img)
+            augmented_images.append(aug_img)
+            augmented_labels.append(label)
+
+    dataset.transform = raw_transform
+    return augmented_images, augmented_labels
+
 def load_dataset(root_dir, batch_size=32):
-    train_dataset = datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=transform)
-    test_dataset = datasets.ImageFolder(os.path.join(root_dir, 'test'), transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    return train_loader, test_loader, train_dataset.classes
+    raw_train = datasets.ImageFolder(os.path.join(root_dir, 'train'))
+    test_dataset = datasets.ImageFolder(os.path.join(root_dir, 'test'), transform=base_transform)
+
+    train_dataset = TensorLabelWrapper(datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=base_transform))
+
+    augmented_images, augmented_labels = augment_dataset(raw_train, num_augmentations=5)
+    augmented_dataset = AugmentedDataset(augmented_images, augmented_labels)
+
+    combined_dataset = ConcatDataset([train_dataset, augmented_dataset])
+
+    print(f"Original training data size: {len(train_dataset)}")
+    print(f"Augmented samples added: {len(augmented_dataset)}")
+    print(f"Total training data size: {len(combined_dataset)}")
+
+    train_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    return train_loader, test_loader, raw_train.classes
 
 def train_model(train_loader, test_loader, num_classes, num_epochs=40, lr=1e-3):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -102,21 +166,28 @@ def train_model(train_loader, test_loader, num_classes, num_epochs=40, lr=1e-3):
     return model, all_preds, all_labels
 
 def show_confusion(y_true, y_pred, class_names):
-    cm = confusion_matrix(y_true, y_pred)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    numeric_labels = [int(name) for name in class_names]
+    sorted_indices = sorted(range(len(numeric_labels)), key=lambda i: numeric_labels[i])
+    sorted_class_names = [class_names[i] for i in sorted_indices]
+
+    label_map = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted_indices)}
+    remapped_y_true = [label_map[label] for label in y_true]
+    remapped_y_pred = [label_map[label] for label in y_pred]
+
+    cm = confusion_matrix(remapped_y_true, remapped_y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[str(name) for name in sorted(numeric_labels)])
     disp.plot(xticks_rotation=45, cmap='Blues')
-    plt.title("Confusion Matrix")
+    plt.title("Confusion Matrix (Sorted by Cycles)")
     plt.tight_layout()
     plt.show()
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
-# Check if CUDA is available and print GPU information
-print("CUDA Available:", torch.cuda.is_available())
-print("GPU Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only")
+if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+    print("CUDA Available:", torch.cuda.is_available())
+    print("GPU Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only")
 
-# Example usage:
-root_dir = 'D:\\jungha\\2025 Spring\\MEC510\\term project\\Processed_Data\\manmade'
-train_loader, test_loader, class_names = load_dataset(root_dir)
-model, y_pred, y_true = train_model(train_loader, test_loader, num_classes=len(class_names))
-show_confusion(y_true, y_pred, class_names)
+    root_dir = 'D:\\jungha\\2025 Spring\\MEC510\\term project\\Processed_Data\\manmade'
+    train_loader, test_loader, class_names = load_dataset(root_dir)
+    model, y_pred, y_true = train_model(train_loader, test_loader, num_classes=len(class_names))
+    show_confusion(y_true, y_pred, class_names)

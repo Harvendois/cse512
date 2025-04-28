@@ -50,8 +50,8 @@ transform = transforms.Compose([
 def load_dataset(root_dir, batch_size=32):
     train_dataset = datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=transform)
     test_dataset = datasets.ImageFolder(os.path.join(root_dir, 'test'), transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
     return train_loader, test_loader, train_dataset.classes
 
 def train_model(train_loader, test_loader, num_classes, num_epochs=40, lr=1e-3):
@@ -120,9 +120,10 @@ print("Using device:", device)
 print("CUDA Available:", torch.cuda.is_available())
 print("GPU Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only")
 
-# Example usage:
-root_dir = 'D:\\jungha\\2025 Spring\\MEC510\\term project\\Processed_Data\\manmade'
-train_loader, test_loader, class_names = load_dataset(root_dir)
-model, y_pred, y_true = train_model(train_loader, test_loader, num_classes=len(class_names))
-show_confusion(y_true, y_pred, class_names)
+if __name__ == '__main__':
+    # Example usage:
+    root_dir = 'D:\\jungha\\2025 Spring\\MEC510\\term project\\Processed_Data\\manmade'
+    train_loader, test_loader, class_names = load_dataset(root_dir)
+    model, y_pred, y_true = train_model(train_loader, test_loader, num_classes=len(class_names))
+    show_confusion(y_true, y_pred, class_names) 
 
