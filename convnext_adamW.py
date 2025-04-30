@@ -11,9 +11,9 @@ import os
 import random
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
-from torchvision.models import EfficientNet_B3_Weights
+from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights
 from tqdm import tqdm
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Set random seed
 torch.manual_seed(42)
@@ -23,23 +23,21 @@ random.seed(42)
 def repeat_channels(x):
     return x.repeat(3, 1, 1)
 
-# Ordinal-aware loss (distance-penalized Cross Entropy)
-class OrdinalLoss(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        self.num_classes = num_classes
-        self.ce = nn.CrossEntropyLoss(reduction='none')
+# class OrdinalLoss(nn.Module):
+#     def __init__(self, num_classes):
+#         super().__init__()
+#         self.num_classes = num_classes
+#         self.ce = nn.CrossEntropyLoss(reduction='none')
 
-    def forward(self, logits, targets):
-        base_loss = self.ce(logits, targets)
-        pred_labels = torch.argmax(logits, dim=1)
-        distance = torch.abs(pred_labels - targets).float()
-        return (1 + distance) * base_loss
+#     def forward(self, logits, targets):
+#         base_loss = self.ce(logits, targets)
+#         pred_labels = torch.argmax(logits, dim=1)
+#         distance = torch.abs(pred_labels - targets).float()
+#         return (1 + distance) * base_loss
 
-# Preprocessing and augmentation pipeline
 base_transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=1),
-    transforms.Resize((300, 300)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.5], std=[0.5]),
     transforms.Lambda(repeat_channels)
@@ -47,7 +45,7 @@ base_transform = transforms.Compose([
 
 aug_transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=1),
-    transforms.Resize((300, 300)),
+    transforms.Resize((224, 224)),
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(degrees=25),
     transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
@@ -113,19 +111,19 @@ def load_dataset(root_dir, batch_size=32):
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     return train_loader, test_loader, raw_train.classes
 
-def train_model(train_loader, test_loader, num_classes, num_epochs=15, lr=1e-3):
+def train_model(train_loader, test_loader, num_classes, num_epochs=50, lr=1e-3):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = models.efficientnet_b3(weights=EfficientNet_B3_Weights.DEFAULT)
-    model.classifier[1] = nn.Sequential(
+    model = convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+    model.classifier[2] = nn.Sequential(
         nn.Dropout(p=0.4),
-        nn.Linear(model.classifier[1].in_features, num_classes)
+        nn.Linear(model.classifier[2].in_features, num_classes)
     )
     model = model.to(device)
 
-    criterion = OrdinalLoss(num_classes=num_classes)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    # optimizer = optim.Adadelta(model.parameters(), lr=lr, rho=0.95, eps=1e-08, weight_decay=0.01)
-    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
+    # criterion = OrdinalLoss(num_classes=num_classes)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
 
     for epoch in range(num_epochs):
         model.train()
@@ -162,7 +160,7 @@ def train_model(train_loader, test_loader, num_classes, num_epochs=15, lr=1e-3):
 
         test_acc = correct / total * 100
         print(f"Test Accuracy: {test_acc:.2f}%\n")
-        scheduler.step(test_acc)
+        scheduler.step()
 
     return model, all_preds, all_labels
 
