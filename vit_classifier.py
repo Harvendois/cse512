@@ -11,7 +11,7 @@ import os
 import random
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
-from torchvision.models import EfficientNet_B3_Weights
+from torchvision.models import vit_b_16, ViT_B_16_Weights
 from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -20,7 +20,8 @@ torch.manual_seed(42)
 np.random.seed(42)
 random.seed(42)
 
-
+def repeat_channels(x):
+    return x.repeat(3, 1, 1)
 
 # Ordinal-aware loss (distance-penalized Cross Entropy)
 class OrdinalLoss(nn.Module):
@@ -36,20 +37,24 @@ class OrdinalLoss(nn.Module):
         return (1 + distance) * base_loss
 
 # Preprocessing and augmentation pipeline
-# Base transform for normalizing image intensity values by computing mean and std of the entire dataset
-# and then applying normalization
 base_transform = transforms.Compose([
-    transforms.Resize((300, 300)),
+    transforms.Grayscale(num_output_channels=1),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5]),
+    transforms.Lambda(repeat_channels)
 ])
 
 aug_transform = transforms.Compose([
-    transforms.Resize((300, 300)),
+    transforms.Grayscale(num_output_channels=1),
+    transforms.Resize((224, 224)),
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(degrees=25),
     transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
     transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.5),
     transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5]),
+    transforms.Lambda(repeat_channels)
 ])
 
 class TensorLabelWrapper(Dataset):
@@ -90,65 +95,37 @@ def augment_dataset(dataset, num_augmentations):
     return augmented_images, augmented_labels
 
 def load_dataset(root_dir, batch_size=32):
-    # Load the raw training dataset without normalization for mean and std calculation
-    raw_train = datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=transforms.Compose([
-        transforms.Resize((300, 300)),
-        transforms.ToTensor()
-    ]))
-
-    # Calculate mean and std for the training dataset
-    mean, std = calculate_mean_std(raw_train)
-    print(f"Calculated Mean: {mean}, Calculated Std: {std}")
-
-    # Define transforms with calculated mean and std
-    base_transform = transforms.Compose([
-        transforms.Resize((300, 300)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[mean], std=[std])  # Use calculated values
-    ])
-
-    aug_transform = transforms.Compose([
-        transforms.Resize((300, 300)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(degrees=25),
-        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
-        #transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.5),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[mean], std=[std])  # Use calculated values
-    ])
-
-    # Reload datasets with updated transforms
-    train_dataset = TensorLabelWrapper(datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=base_transform))
+    raw_train = datasets.ImageFolder(os.path.join(root_dir, 'train'))
     test_dataset = datasets.ImageFolder(os.path.join(root_dir, 'test'), transform=base_transform)
 
-    # Augment the training dataset
-    augmented_images, augmented_labels = augment_dataset(raw_train, num_augmentations=1)
+    train_dataset = TensorLabelWrapper(datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=base_transform))
+
+    augmented_images, augmented_labels = augment_dataset(raw_train, num_augmentations=10)
     augmented_dataset = AugmentedDataset(augmented_images, augmented_labels)
 
-    # Combine original and augmented datasets
     combined_dataset = ConcatDataset([train_dataset, augmented_dataset])
 
     print(f"Original training data size: {len(train_dataset)}")
     print(f"Augmented samples added: {len(augmented_dataset)}")
     print(f"Total training data size: {len(combined_dataset)}")
 
-    # Create DataLoaders
     train_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     return train_loader, test_loader, raw_train.classes
 
-def train_model(train_loader, test_loader, num_classes, num_epochs=25, lr=1e-3):
+def train_model(train_loader, test_loader, num_classes, num_epochs=15, lr=1e-3):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = models.efficientnet_b3(weights=EfficientNet_B3_Weights.DEFAULT)
-    model.classifier[1] = nn.Sequential(
-        nn.Dropout(p=0.6),
-        nn.Linear(model.classifier[1].in_features, num_classes)
+    weights = ViT_B_16_Weights.DEFAULT
+    model = vit_b_16(weights=weights)
+    model.heads = nn.Sequential(
+        nn.Dropout(p=0.4),
+        nn.Linear(model.heads.head.in_features, num_classes)
     )
     model = model.to(device)
 
     criterion = OrdinalLoss(num_classes=num_classes)
-    #optimizer = optim.Adam(model.parameters(), lr=lr)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    # optimizer = optim.Adadelta(model.parameters(), lr=lr, rho=0.95, eps=1e-08, weight_decay=0.01)
     scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
 
     for epoch in range(num_epochs):
@@ -198,31 +175,6 @@ def show_confusion(y_true, y_pred, class_names):
     plt.tight_layout()
     plt.show()
 
-def calculate_mean_std(dataset):
-    """
-    Calculate the mean and standard deviation of pixel intensities across the dataset.
-    Args:
-        dataset: A PyTorch dataset object.
-    Returns:
-        mean: Mean pixel intensity.
-        std: Standard deviation of pixel intensity.
-    """
-    loader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4)
-    mean = 0.0
-    std = 0.0
-    total_images = 0
-
-    for images, _ in loader:
-        # Flatten the images to calculate mean and std across all pixels
-        images = images.view(images.size(0), -1)
-        mean += images.mean(1).sum()
-        std += images.std(1).sum()
-        total_images += images.size(0)
-
-    mean /= total_images
-    std /= total_images
-    return mean.item(), std.item()
-
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
@@ -233,4 +185,3 @@ if __name__ == '__main__':
     train_loader, test_loader, class_names = load_dataset(root_dir)
     model, y_pred, y_true = train_model(train_loader, test_loader, num_classes=len(class_names))
     show_confusion(y_true, y_pred, class_names)
-

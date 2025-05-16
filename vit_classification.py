@@ -11,7 +11,7 @@ import os
 import random
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
-from torchvision.models import EfficientNet_B3_Weights
+from torchvision.models import vit_b_16, ViT_B_16_Weights
 from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -35,23 +35,6 @@ class OrdinalLoss(nn.Module):
         distance = torch.abs(pred_labels - targets).float()
         return (1 + distance) * base_loss
 
-# Preprocessing and augmentation pipeline
-# Base transform for normalizing image intensity values by computing mean and std of the entire dataset
-# and then applying normalization
-base_transform = transforms.Compose([
-    transforms.Resize((300, 300)),
-    transforms.ToTensor(),
-])
-
-aug_transform = transforms.Compose([
-    transforms.Resize((300, 300)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(degrees=25),
-    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
-    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.5),
-    transforms.ToTensor(),
-])
-
 class TensorLabelWrapper(Dataset):
     def __init__(self, dataset):
         self.dataset = dataset
@@ -74,7 +57,7 @@ class AugmentedDataset(Dataset):
     def __getitem__(self, idx):
         return self.images[idx], torch.tensor(self.labels[idx], dtype=torch.long)
 
-def augment_dataset(dataset, num_augmentations):
+def augment_dataset(dataset, num_augmentations, aug_transform):
     augmented_images = []
     augmented_labels = []
     raw_transform = dataset.transform
@@ -92,7 +75,7 @@ def augment_dataset(dataset, num_augmentations):
 def load_dataset(root_dir, batch_size=32):
     # Load the raw training dataset without normalization for mean and std calculation
     raw_train = datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=transforms.Compose([
-        transforms.Resize((300, 300)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor()
     ]))
 
@@ -102,27 +85,27 @@ def load_dataset(root_dir, batch_size=32):
 
     # Define transforms with calculated mean and std
     base_transform = transforms.Compose([
-        transforms.Resize((300, 300)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[mean], std=[std])  # Use calculated values
     ])
 
     aug_transform = transforms.Compose([
-        transforms.Resize((300, 300)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(degrees=25),
-        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
-        #transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.5),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[mean], std=[std])  # Use calculated values
-    ])
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(degrees=25),
+    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+    # transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.5),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[mean], std=[std])  # Use calculated values
+])
 
     # Reload datasets with updated transforms
     train_dataset = TensorLabelWrapper(datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=base_transform))
     test_dataset = datasets.ImageFolder(os.path.join(root_dir, 'test'), transform=base_transform)
 
     # Augment the training dataset
-    augmented_images, augmented_labels = augment_dataset(raw_train, num_augmentations=1)
+    augmented_images, augmented_labels = augment_dataset(raw_train, num_augmentations=10, aug_transform=aug_transform)
     augmented_dataset = AugmentedDataset(augmented_images, augmented_labels)
 
     # Combine original and augmented datasets
@@ -137,17 +120,24 @@ def load_dataset(root_dir, batch_size=32):
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     return train_loader, test_loader, raw_train.classes
 
-def train_model(train_loader, test_loader, num_classes, num_epochs=25, lr=1e-3):
+def train_model(train_loader, test_loader, num_classes, num_epochs=15, lr=1e-3):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = models.efficientnet_b3(weights=EfficientNet_B3_Weights.DEFAULT)
-    model.classifier[1] = nn.Sequential(
-        nn.Dropout(p=0.6),
-        nn.Linear(model.classifier[1].in_features, num_classes)
-    )
+    print(f"Using device: {device}")
+
+    # Load the Vision Transformer model
+    weights = ViT_B_16_Weights.DEFAULT
+    model = vit_b_16(weights=weights)
+
+    # Modify the classifier head for the number of classes in your dataset
+    # Modify the classifier head with a dropout layer
+    model.heads.head = nn.Sequential(
+    nn.Dropout(p=0.4),  # Add a dropout layer with 40% dropout rate
+    nn.Linear(model.heads.head.in_features, num_classes)
+)
     model = model.to(device)
 
+    # Define the loss function and optimizer
     criterion = OrdinalLoss(num_classes=num_classes)
-    #optimizer = optim.Adam(model.parameters(), lr=lr)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
 

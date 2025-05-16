@@ -26,7 +26,7 @@ def repeat_channels(x):
 base_transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=1),
     transforms.Resize((224, 224)),
-    transforms.ToTensor(), # [0, 1] range
+    transforms.ToTensor(),
     transforms.Normalize(mean=[0.5], std=[0.5]),
     transforms.Lambda(repeat_channels)
 ])
@@ -65,20 +65,6 @@ class AugmentedDataset(Dataset):
     def __getitem__(self, idx):
         return self.images[idx], torch.tensor(self.labels[idx] / 10.0, dtype=torch.float)
 
-def mixup_data(x, y, alpha=1.0):
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-    batch_size = x.size()[0]
-    index = torch.randperm(batch_size).to(x.device)
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-
 def augment_dataset(dataset, num_augmentations):
     augmented_images = []
     augmented_labels = []
@@ -100,7 +86,7 @@ def load_dataset(root_dir, batch_size=32):
 
     train_dataset = FloatLabelWrapper(datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=base_transform))
 
-    augmented_images, augmented_labels = augment_dataset(raw_train, num_augmentations=10)
+    augmented_images, augmented_labels = augment_dataset(raw_train, num_augmentations=5)
     augmented_dataset = AugmentedDataset(augmented_images, augmented_labels)
 
     combined_dataset = ConcatDataset([train_dataset, augmented_dataset])
@@ -109,8 +95,8 @@ def load_dataset(root_dir, batch_size=32):
     print(f"Augmented samples added: {len(augmented_dataset)}")
     print(f"Total training data size: {len(combined_dataset)}")
 
-    train_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True,)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     return train_loader, test_loader
 
 def train_model(train_loader, test_loader, num_epochs=50, lr=1e-4):
@@ -123,7 +109,8 @@ def train_model(train_loader, test_loader, num_epochs=50, lr=1e-4):
     )
     model = model.to(device)
 
-    criterion = nn.MSELoss()
+    criterion = nn.MSELoss()  # Use MSELoss for regression
+    #criterion = nn.SmoothL1Loss() 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
 
@@ -133,11 +120,9 @@ def train_model(train_loader, test_loader, num_epochs=50, lr=1e-4):
         for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             images, labels = images.to(device), labels.to(device)
 
-            images, targets_a, targets_b, lam = mixup_data(images, labels, alpha=0.2)
-
             optimizer.zero_grad()
             outputs = model(images).squeeze(1)
-            loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -163,6 +148,7 @@ def train_model(train_loader, test_loader, num_epochs=50, lr=1e-4):
     print(f"RMSE: {rmse:.2f}")
 
     return model, all_preds, all_labels
+
 
 def plot_predictions(y_true, y_pred):
     plt.figure(figsize=(8, 6))
