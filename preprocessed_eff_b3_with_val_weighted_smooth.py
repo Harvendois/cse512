@@ -1,0 +1,209 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+import torchvision.models as models
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, ConcatDataset
+import numpy as np
+import os
+import random
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+from torchvision.models import EfficientNet_B3_Weights
+from tqdm import tqdm
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+# Set random seed
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+
+# Ordinal-aware loss (distance-penalized Cross Entropy)
+
+class OrdinalLoss(nn.Module):
+    def __init__(self, num_classes, class_weights=None, smoothing=0.1):
+        super().__init__()
+        self.num_classes = num_classes
+        self.smoothing = smoothing
+        self.ce = nn.CrossEntropyLoss(weight=torch.tensor([0.8545, 0.8545, 0.8545, 1.0682, 1.0682, 1.0682, 1.0682, 1.0682, 1.0682, 1.0682, 1.0682], dtype=torch.float), reduction='none') if class_weights else nn.CrossEntropyLoss(reduction='none')
+
+    def forward(self, logits, targets):
+        if self.smoothing > 0:
+            with torch.no_grad():
+                true_dist = torch.zeros_like(logits)
+                true_dist.fill_(self.smoothing / (self.num_classes - 1))
+                true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
+            base_loss = torch.sum(-true_dist * torch.log_softmax(logits, dim=1), dim=1)
+        else:
+            base_loss = self.ce(logits, targets)
+
+        pred_labels = torch.argmax(logits, dim=1)
+        distance = torch.abs(pred_labels - targets).float()
+        return (1 + distance) * base_loss
+
+base_transform = transforms.Compose([
+    transforms.Resize((300, 300)),
+    transforms.ToTensor(),
+])
+
+aug_transform = transforms.Compose([
+    transforms.Resize((300, 300)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(degrees=25),
+    transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.5),
+    transforms.ToTensor(),
+])
+
+class TensorLabelWrapper(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        image, label = self.dataset[idx]
+        return image, torch.tensor(label, dtype=torch.long)
+
+class AugmentedDataset(Dataset):
+    def __init__(self, images, labels):
+        self.images = images
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        return self.images[idx], torch.tensor(self.labels[idx], dtype=torch.long)
+
+def augment_dataset(dataset, num_augmentations):
+    augmented_images = []
+    augmented_labels = []
+    raw_transform = dataset.transform
+    dataset.transform = None
+
+    for img, label in dataset:
+        for _ in range(num_augmentations):
+            aug_img = aug_transform(img)
+            augmented_images.append(aug_img)
+            augmented_labels.append(label)
+
+    dataset.transform = raw_transform
+    return augmented_images, augmented_labels
+
+def load_dataset(root_dir, batch_size=16, num_augmentations=15):
+    # Load the raw training dataset without normalization for mean and std calculation
+    raw_train = datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=transforms.Compose([
+        transforms.Resize((300, 300)),
+        transforms.ToTensor()
+    ]))
+
+    # Define transforms with calculated mean and std
+    base_transform = transforms.Compose([
+        transforms.Resize((300, 300)),
+        transforms.ToTensor()
+    ])
+
+    aug_transform = transforms.Compose([
+        transforms.Resize((300, 300)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(degrees=25),
+        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+        transforms.ToTensor()
+    ])
+
+    # Reload datasets with updated transforms
+    train_dataset = TensorLabelWrapper(datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=base_transform))
+    test_dataset = datasets.ImageFolder(os.path.join(root_dir, 'test'), transform=base_transform)
+
+    # Augment the training dataset
+    augmented_images, augmented_labels = augment_dataset(raw_train, num_augmentations)
+    augmented_dataset = AugmentedDataset(augmented_images, augmented_labels)
+
+    # Combine original and augmented datasets
+    combined_dataset = ConcatDataset([train_dataset, augmented_dataset])
+
+    print(f"Original training data size: {len(train_dataset)}")
+    print(f"Augmented samples added: {len(augmented_dataset)}")
+    print(f"Total training data size: {len(combined_dataset)}")
+
+    # Create DataLoaders
+    train_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    return train_loader, test_loader, raw_train.classes
+
+def train_model(train_loader, test_loader, num_classes, num_epochs=40, lr=1e-3):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = models.efficientnet_b3(weights=EfficientNet_B3_Weights.DEFAULT)
+    model.classifier[1] = nn.Sequential(
+        nn.Dropout(p=0.7),
+        nn.Linear(model.classifier[1].in_features, num_classes)
+    )
+    model = model.to(device)
+
+    criterion = OrdinalLoss(num_classes=num_classes, class_weights=True, smoothing=0.25)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    # scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
+    scheduler = CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-6)
+
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss, correct, total = 0, 0, 0
+        for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels).mean()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            preds = outputs.argmax(1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+        train_acc = correct / total * 100
+        print(f"Epoch {epoch+1}, Train Loss: {total_loss:.4f}, Accuracy: {train_acc:.2f}%")
+
+        # Evaluate
+        model.eval()
+        correct, total = 0, 0
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                preds = outputs.argmax(1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
+        test_acc = correct / total * 100
+        print(f"Test Accuracy: {test_acc:.2f}%\n")
+        scheduler.step(test_acc)
+
+    return model, all_preds, all_labels
+
+def show_confusion(y_true, y_pred, class_names):
+    cm = confusion_matrix(y_true, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    disp.plot(xticks_rotation=45, cmap='Blues')
+    plt.title("Confusion Matrix")
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+    print("CUDA Available:", torch.cuda.is_available())
+    print("GPU Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only")
+
+    root_dir = 'D:\\jungha\\2025_Spring\\MEC510\\term_project\\Processed_Data\\manmade'
+    train_loader, test_loader, class_names = load_dataset(root_dir)
+    model, y_pred, y_true = train_model(train_loader, test_loader, num_classes=len(class_names))
+    show_confusion(y_true, y_pred, class_names)

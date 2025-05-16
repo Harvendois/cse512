@@ -9,3 +9,4 @@
 /termproject/
 /Processed_Data/
 .gitignore
+*.pt
