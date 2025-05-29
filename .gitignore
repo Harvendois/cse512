@@ -10,3 +10,6 @@
 /Processed_Data/
 .gitignore
 *.pt
+/best_models/
+*.npy
+*.pth

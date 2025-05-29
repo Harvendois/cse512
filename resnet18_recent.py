@@ -1,0 +1,300 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+import torchvision.models as models
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, ConcatDataset
+import numpy as np
+import os
+import random
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+from torchvision.models import EfficientNet_B3_Weights, EfficientNet_B5_Weights, vit_b_16, ViT_B_16_Weights
+from tqdm import tqdm
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from sklearn.metrics import precision_recall_fscore_support
+
+
+# Set random seed
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+
+# Ordinal-aware loss (distance-penalized Cross Entropy)
+class OrdinalLoss(nn.Module):
+    def __init__(self, num_classes, class_weights=None, smoothing=0.2):
+        super().__init__()
+        self.num_classes = num_classes
+        self.smoothing = smoothing
+        self.ce = nn.CrossEntropyLoss(weight=torch.tensor([0.8545, 0.8545, 0.8545, 1.0682, 1.0682, 1.0682, 1.0682, 1.0682, 1.0682, 1.0682, 1.0682], dtype=torch.float), reduction='none') if class_weights else nn.CrossEntropyLoss(reduction='none')
+
+    def forward(self, logits, targets):
+        if self.smoothing > 0:
+            with torch.no_grad():
+                true_dist = torch.zeros_like(logits)
+                true_dist.fill_(self.smoothing / (self.num_classes - 1))
+                true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
+            base_loss = torch.sum(-true_dist * torch.log_softmax(logits, dim=1), dim=1)
+        else:
+            base_loss = self.ce(logits, targets)
+
+        alpha = 1.3     # distance penalty weight
+        pred_labels = torch.argmax(logits, dim=1)
+        distance = torch.abs(pred_labels - targets).float()
+
+        self.last_base_loss = base_loss.mean().item()
+        self.last_distance = distance.mean().item()
+
+        return (1 + alpha*distance) * base_loss
+
+base_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+aug_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
+    transforms.RandomRotation(degrees=25),
+    transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.5),
+    transforms.ToTensor(),
+])
+
+class TensorLabelWrapper(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        image, label = self.dataset[idx]
+        return image, torch.tensor(label, dtype=torch.long)
+
+class AugmentedDataset(Dataset):
+    def __init__(self, images, labels):
+        self.images = images
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        return self.images[idx], torch.tensor(self.labels[idx], dtype=torch.long)
+
+def augment_dataset(dataset, num_augmentations):
+    augmented_images = []
+    augmented_labels = []
+    raw_transform = dataset.transform
+    dataset.transform = None
+
+    for img, label in dataset:
+        for _ in range(num_augmentations):
+            aug_img = aug_transform(img)
+            augmented_images.append(aug_img)
+            augmented_labels.append(label)
+
+    dataset.transform = raw_transform
+    return augmented_images, augmented_labels
+
+def load_dataset(root_dir, batch_size=16, num_augmentations=5):
+    # Load the raw training dataset without normalization for mean and std calculation
+    raw_train = datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ]))
+
+    # Define transforms with calculated mean and std
+    base_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
+
+    # Reload datasets with updated transforms
+    train_dataset = TensorLabelWrapper(datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=base_transform))
+    test_dataset = datasets.ImageFolder(os.path.join(root_dir, 'test'), transform=base_transform)
+
+    # Augment the training dataset
+    augmented_images, augmented_labels = augment_dataset(raw_train, num_augmentations)
+    augmented_dataset = AugmentedDataset(augmented_images, augmented_labels)
+
+    # Combine original and augmented datasets
+    combined_dataset = ConcatDataset([train_dataset, augmented_dataset])
+
+    print(f"Original training data size: {len(train_dataset)}")
+    print(f"Augmented samples added: {len(augmented_dataset)}")
+    print(f"Total training data size: {len(combined_dataset)}")
+
+    # Create DataLoaders
+    train_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    return train_loader, test_loader, raw_train.classes
+
+def train_model(train_loader, test_loader, num_classes, num_epochs=20, lr=4e-4):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = vit_b_16(weights=ViT_B_16_Weights.DEFAULT)
+    model.heads = nn.Sequential(
+        nn.Dropout(p=0.85),
+        nn.Linear(model.heads.head.in_features, num_classes)
+    )
+
+    model = model.to(device)
+
+    criterion = OrdinalLoss(num_classes=num_classes, class_weights=True)
+    # optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=2e-7)
+    # optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.2)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=2e-7)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+    best_acc = 0.0
+
+    train_accuracies = []
+    test_accuracies = []
+    losses = []
+    precisions = []
+    recalls = []
+    f1_scores = []
+
+
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss, correct, total = 0, 0, 0
+        for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels).mean()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            preds = outputs.argmax(1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+        losses.append(total_loss)
+        train_acc = correct / total * 100
+        train_accuracies.append(train_acc)
+
+        print(f"Epoch {epoch+1}, Train Loss: {total_loss:.4f}, Current LR: {scheduler.get_last_lr()}, Accuracy: {train_acc:.2f}%")
+
+        # Evaluate
+        model.eval()
+        correct, total = 0, 0
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                preds = outputs.argmax(1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
+        test_acc = correct / total * 100
+        test_accuracies.append(test_acc)
+        scheduler.step(test_acc)
+
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_labels, all_preds, average='macro', zero_division=0
+        )
+
+        precisions.append(precision)
+        recalls.append(recall)
+        f1_scores.append(f1)
+
+        print(f"Test Accuracy: {test_acc:.2f}%")
+        print(f"Macro Precision: {precision:.4f} | Recall: {recall:.4f} | F1 Score: {f1:.4f}\n")
+
+
+        # Save best model and its predictions
+        if test_acc > best_acc:
+            best_acc = test_acc
+            torch.save(model.state_dict(), "best_model_ordinal_preprocessed.pth")
+            np.save("best_preds.npy", np.array(all_preds))
+            np.save("best_labels.npy", np.array(all_labels))
+            print(f"✅ Saved new best model and predictions at Epoch {epoch+1} with Test Accuracy: {test_acc:.2f}%")
+
+    plt.figure(figsize=(10,6))
+    plt.plot(range(1, num_epochs+1), train_accuracies, label='Train Accuracy', marker='o')
+    plt.plot(range(1, num_epochs+1), test_accuracies, label='Test Accuracy', marker='s')
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy (%)")
+    plt.title("Training vs Test Accuracy Over Epochs")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(10,6))
+    plt.plot(range(1, num_epochs+1), losses, label='Train Loss', marker='o')
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training Loss Over Epochs")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(10,6))
+    plt.plot(range(1, num_epochs+1), precisions, label='Precision', marker='^')
+    plt.plot(range(1, num_epochs+1), recalls, label='Recall', marker='v')
+    plt.plot(range(1, num_epochs+1), f1_scores, label='F1 Score', marker='*')
+    plt.xlabel("Epoch")
+    plt.ylabel("Score")
+    plt.title("Precision / Recall / F1 Score Over Epochs")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+    return model, all_preds, all_labels
+
+def show_confusion(y_true, y_pred, class_names):
+    cm = confusion_matrix(y_true, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    disp.plot(xticks_rotation=45, cmap='Blues')
+    plt.title("Confusion Matrix")
+    plt.tight_layout()
+    plt.show()
+
+def compare_confusion_matrices(y_true_final, y_pred_final, class_names):
+    # Load saved best model predictions
+    if os.path.exists("best_preds.npy") and os.path.exists("best_labels.npy"):
+        y_pred_best = np.load("best_preds.npy")
+        y_true_best = np.load("best_labels.npy")
+
+        print("📊 Best Epoch Confusion Matrix")
+        cm_best = confusion_matrix(y_true_best, y_pred_best)
+        disp_best = ConfusionMatrixDisplay(confusion_matrix=cm_best, display_labels=class_names)
+        disp_best.plot(xticks_rotation=45, cmap='Greens')
+        plt.title("Best Epoch")
+        plt.tight_layout()
+        plt.show()
+
+    print("📊 Final Epoch Confusion Matrix")
+    cm_final = confusion_matrix(y_true_final, y_pred_final)
+    disp_final = ConfusionMatrixDisplay(confusion_matrix=cm_final, display_labels=class_names)
+    disp_final.plot(xticks_rotation=45, cmap='Blues')
+    plt.title("Final Epoch")
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+    print("CUDA Available:", torch.cuda.is_available())
+    print("GPU Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only")
+
+    root_dir = 'D:\\jungha\\2025_Spring\\MEC510\\term_project\\Processed_Data\\manmade'
+    train_loader, test_loader, class_names = load_dataset(root_dir)
+    model, y_pred, y_true = train_model(train_loader, test_loader, num_classes=len(class_names))
+    # show_confusion(y_true, y_pred, class_names)
+    compare_confusion_matrices(y_true, y_pred, class_names)

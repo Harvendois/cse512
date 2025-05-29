@@ -11,7 +11,7 @@ import os
 import random
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
-from torchvision.models import EfficientNet_B3_Weights
+from torchvision.models import EfficientNet_B3_Weights, EfficientNet_B7_Weights
 from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -22,9 +22,8 @@ np.random.seed(42)
 random.seed(42)
 
 # Ordinal-aware loss (distance-penalized Cross Entropy)
-
 class OrdinalLoss(nn.Module):
-    def __init__(self, num_classes, class_weights=None, smoothing=0.1):
+    def __init__(self, num_classes, class_weights=None, smoothing=0.2):
         super().__init__()
         self.num_classes = num_classes
         self.smoothing = smoothing
@@ -40,9 +39,14 @@ class OrdinalLoss(nn.Module):
         else:
             base_loss = self.ce(logits, targets)
 
+        alpha = 1.3     # distance penalty weight
         pred_labels = torch.argmax(logits, dim=1)
         distance = torch.abs(pred_labels - targets).float()
-        return (1 + distance) * base_loss
+
+        self.last_base_loss = base_loss.mean().item()
+        self.last_distance = distance.mean().item()
+
+        return (1 + alpha*distance) * base_loss
 
 base_transform = transforms.Compose([
     transforms.Resize((300, 300)),
@@ -52,6 +56,7 @@ base_transform = transforms.Compose([
 aug_transform = transforms.Compose([
     transforms.Resize((300, 300)),
     transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
     transforms.RandomRotation(degrees=25),
     transforms.RandomAffine(degrees=10, translate=(0.05, 0.05)),
     transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.5),
@@ -95,7 +100,7 @@ def augment_dataset(dataset, num_augmentations):
     dataset.transform = raw_transform
     return augmented_images, augmented_labels
 
-def load_dataset(root_dir, batch_size=16, num_augmentations=15):
+def load_dataset(root_dir, batch_size=16, num_augmentations=5):
     # Load the raw training dataset without normalization for mean and std calculation
     raw_train = datasets.ImageFolder(os.path.join(root_dir, 'train'), transform=transforms.Compose([
         transforms.Resize((300, 300)),
@@ -105,14 +110,6 @@ def load_dataset(root_dir, batch_size=16, num_augmentations=15):
     # Define transforms with calculated mean and std
     base_transform = transforms.Compose([
         transforms.Resize((300, 300)),
-        transforms.ToTensor()
-    ])
-
-    aug_transform = transforms.Compose([
-        transforms.Resize((300, 300)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(degrees=25),
-        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
         transforms.ToTensor()
     ])
 
@@ -136,19 +133,23 @@ def load_dataset(root_dir, batch_size=16, num_augmentations=15):
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
     return train_loader, test_loader, raw_train.classes
 
-def train_model(train_loader, test_loader, num_classes, num_epochs=40, lr=1e-3):
+def train_model(train_loader, test_loader, num_classes, num_epochs=10, lr=6e-4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = models.efficientnet_b3(weights=EfficientNet_B3_Weights.DEFAULT)
     model.classifier[1] = nn.Sequential(
-        nn.Dropout(p=0.7),
+        nn.Dropout(p=0.85),
         nn.Linear(model.classifier[1].in_features, num_classes)
     )
     model = model.to(device)
 
-    criterion = OrdinalLoss(num_classes=num_classes, class_weights=True, smoothing=0.25)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    # scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
-    scheduler = CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-6)
+    criterion = OrdinalLoss(num_classes=num_classes, class_weights=True, smoothing=0.2)
+    #optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=2e-5)
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.8)
+
+    best_acc = 0.0
+
+    train_accuracies = []
+    test_accuracies = []
 
     for epoch in range(num_epochs):
         model.train()
@@ -162,11 +163,14 @@ def train_model(train_loader, test_loader, num_classes, num_epochs=40, lr=1e-3):
             optimizer.step()
 
             total_loss += loss.item()
+
             preds = outputs.argmax(1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
         train_acc = correct / total * 100
+        train_accuracies.append(train_acc)
+
         print(f"Epoch {epoch+1}, Train Loss: {total_loss:.4f}, Accuracy: {train_acc:.2f}%")
 
         # Evaluate
@@ -184,8 +188,29 @@ def train_model(train_loader, test_loader, num_classes, num_epochs=40, lr=1e-3):
                 all_labels.extend(labels.cpu().numpy())
 
         test_acc = correct / total * 100
-        print(f"Test Accuracy: {test_acc:.2f}%\n")
-        scheduler.step(test_acc)
+        test_accuracies.append(test_acc)
+
+        print(f"Test Accuracy: {test_acc:.2f}%\\n")
+
+        # Save best model and its predictions
+        if test_acc > best_acc:
+            best_acc = test_acc
+            torch.save(model.state_dict(), "best_model_ordinal_preprocessed.pth")
+            np.save("best_preds.npy", np.array(all_preds))
+            np.save("best_labels.npy", np.array(all_labels))
+            print(f"✅ Saved new best model and predictions at Epoch {epoch+1} with Test Accuracy: {test_acc:.2f}%")
+
+    plt.figure(figsize=(10,6))
+    plt.plot(range(1, num_epochs+1), train_accuracies, label='Train Accuracy', marker='o')
+    plt.plot(range(1, num_epochs+1), test_accuracies, label='Test Accuracy', marker='s')
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy (%)")
+    plt.title("Training vs Test Accuracy Over Epochs")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
 
     return model, all_preds, all_labels
 
@@ -197,13 +222,36 @@ def show_confusion(y_true, y_pred, class_names):
     plt.tight_layout()
     plt.show()
 
+def compare_confusion_matrices(y_true_final, y_pred_final, class_names):
+    # Load saved best model predictions
+    if os.path.exists("best_preds.npy") and os.path.exists("best_labels.npy"):
+        y_pred_best = np.load("best_preds.npy")
+        y_true_best = np.load("best_labels.npy")
+
+        print("📊 Best Epoch Confusion Matrix")
+        cm_best = confusion_matrix(y_true_best, y_pred_best)
+        disp_best = ConfusionMatrixDisplay(confusion_matrix=cm_best, display_labels=class_names)
+        disp_best.plot(xticks_rotation=45, cmap='Greens')
+        plt.title("Best Epoch")
+        plt.tight_layout()
+        plt.show()
+
+    print("📊 Final Epoch Confusion Matrix")
+    cm_final = confusion_matrix(y_true_final, y_pred_final)
+    disp_final = ConfusionMatrixDisplay(confusion_matrix=cm_final, display_labels=class_names)
+    disp_final.plot(xticks_rotation=45, cmap='Blues')
+    plt.title("Final Epoch")
+    plt.tight_layout()
+    plt.show()
+
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
     print("CUDA Available:", torch.cuda.is_available())
     print("GPU Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU only")
 
-    root_dir = 'D:\\jungha\\2025_Spring\\MEC510\\term_project\\Processed_Data\\manmade'
+    root_dir = 'D:\\jungha\\2025_Spring\\MEC510\\term_project\\Processed_Data\\manmade_preprocessed_clahe_laplacian'
     train_loader, test_loader, class_names = load_dataset(root_dir)
     model, y_pred, y_true = train_model(train_loader, test_loader, num_classes=len(class_names))
-    show_confusion(y_true, y_pred, class_names)
+    # show_confusion(y_true, y_pred, class_names)
+    compare_confusion_matrices(y_true, y_pred, class_names)
